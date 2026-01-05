@@ -204,6 +204,7 @@ export async function handleCommands(params: {
     resolvedVerboseLevel,
     resolvedElevatedLevel,
     resolveDefaultThinkingLevel,
+    provider,
     model,
     contextTokens,
     isGroup,
