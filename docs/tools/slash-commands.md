@@ -44,6 +44,7 @@ They run immediately, are stripped before the model sees the message, and the re
   - Set `discord.commands.native`, `telegram.commands.native`, or `slack.commands.native` to override per provider (bool or `"auto"`).
   - `false` clears previously registered commands on Discord/Telegram at startup. Slack commands are managed in the Slack app and are not removed automatically.
 - `commands.bash` (default `false`) enables `! <cmd>` to run host shell commands (`/bash <cmd>` is an alias; requires `tools.elevated` allowlists).
+- When `commands.bash` is `false`, `/bash` replies with a short enablement hint (config keys + allowlist).
 - `commands.bashForegroundMs` (default `2000`) controls how long bash waits before switching to background mode (`0` backgrounds immediately).
 - `commands.config` (default `false`) enables `/config` (reads/writes `clawdbot.json`).
 - `commands.debug` (default `false`) enables `/debug` (runtime-only overrides).
@@ -89,6 +90,10 @@ Notes:
 - **Fast path:** command-only messages from allowlisted senders are handled immediately (bypass queue + model).
 - **Inline shortcuts (allowlisted senders only):** `/help`, `/commands`, `/status` (`/usage`), `/whoami` (`/id`) also work when embedded in text.
 - Unauthorized command-only messages are silently ignored, and inline `/...` tokens are treated as plain text.
+
+## Security note: `!` / `/bash`
+
+`! <cmd>` and `/bash <cmd>` run **directly on the gateway host** as the gateway user. Keep this disabled unless you fully trust the sender and have locked down allowlists. Treat it like giving someone SSH access to the host.
 
 ## Usage vs cost (what shows where)
 

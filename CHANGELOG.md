@@ -28,6 +28,7 @@
 - Anthropic: merge consecutive user turns (preserve newest metadata) before validation to avoid incorrect role errors.
 - Messaging: enforce context isolation for message tool sends; keep typing indicators alive during tool execution.
 - Auto-reply: `/status` allowlist behavior, reasoning-tag enforcement on fallback, and system-event enqueueing for elevated/reasoning toggles.
+- Auto-reply: explain how to enable `/bash` when it’s disabled; add security notes + FAQ. (#722) — thanks @vrknetha.
 - Auto-reply: resolve ambiguous `/model` matches; fix streaming block reply media handling; keep >300 char heartbeat replies instead of dropping.
 - Discord/Slack: centralize reply-thread planning; fix autoThread routing + add per-channel autoThread; avoid duplicate listeners; keep reasoning italics intact; allow clearing channel parents via message tool.
 - Telegram: preserve forum topic thread ids, persist polling offsets, respect account bindings in webhook mode, and show typing indicator in General topics.

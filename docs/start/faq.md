@@ -99,8 +99,9 @@ Quick answers plus deeper troubleshooting for real-world setups (local dev, VPS,
   - [Is it safe to expose Clawdbot to inbound DMs?](#is-it-safe-to-expose-clawdbot-to-inbound-dms)
   - [WhatsApp: will it message my contacts? How does pairing work?](#whatsapp-will-it-message-my-contacts-how-does-pairing-work)
 - [Chat commands, aborting tasks, and “it won’t stop”](#chat-commands-aborting-tasks-and-it-wont-stop)
-  - [How do I stop/cancel a running task?](#how-do-i-stopcancel-a-running-task)
-  - [Why does it feel like the bot “ignores” rapid‑fire messages?](#why-does-it-feel-like-the-bot-ignores-rapidfire-messages)
+- [How do I stop/cancel a running task?](#how-do-i-stopcancel-a-running-task)
+- [Why does `/bash` say it’s disabled?](#why-does-bash-say-its-disabled)
+- [Why does it feel like the bot “ignores” rapid‑fire messages?](#why-does-it-feel-like-the-bot-ignores-rapidfire-messages)
 - [Common troubleshooting](#common-troubleshooting)
   - [“All models failed” — what should I check first?](#all-models-failed-what-should-i-check-first)
   - [I’m running on my personal WhatsApp number — why is self-chat weird?](#im-running-on-my-personal-whatsapp-number-why-is-self-chat-weird)
@@ -1062,6 +1063,26 @@ process action:kill sessionId:XXX
 Slash commands overview: see [Slash commands](/tools/slash-commands).
 
 Most commands must be sent as a **standalone** message that starts with `/`, but a few shortcuts (like `/status`) also work inline for allowlisted senders.
+
+### Why does `/bash` say it’s disabled?
+
+The host shell command (`! <cmd>` or `/bash <cmd>`) is **disabled by default** because it runs directly on the gateway host. To enable it, update your config and restart the Gateway:
+
+```json5
+{
+  commands: { bash: true },
+  tools: {
+    elevated: {
+      enabled: true,
+      allowFrom: {
+        "<provider>": ["<sender-id>"]
+      }
+    }
+  }
+}
+```
+
+Keep the allowlist tight and avoid enabling it in public rooms. See [Slash commands](/tools/slash-commands) and [Security](/gateway/security).
 
 ### Why does it feel like the bot “ignores” rapid‑fire messages?
 

@@ -12,6 +12,8 @@ read_when:
 - Directive forms: `/elevated on`, `/elevated off`, `/elev on`, `/elev off`.
 - Only `on|off` are accepted; anything else returns a hint and does not change state.
 
+Security note: enabling elevated access or `/bash` effectively grants host shell access. Keep allowlists tight and avoid enabling it in public rooms.
+
 ## What it controls (and what it doesn’t)
 - **Availability gates**: `tools.elevated` is the global baseline. `agents.list[].tools.elevated` can further restrict elevated per agent (both must allow).
 - **Per-session state**: `/elevated on|off` sets the elevated level for the current session key.

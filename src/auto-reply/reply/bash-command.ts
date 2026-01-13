@@ -155,6 +155,30 @@ function buildUsageReply(): ReplyPayload {
   };
 }
 
+function buildBashDisabledReply(provider?: string): ReplyPayload {
+  const providerKey = provider?.trim().toLowerCase() || "<provider>";
+  return {
+    text: [
+      "⚠️ /bash is disabled (default).",
+      "Enable it in your config (host-only; trusted senders only):",
+      "```json5",
+      "{",
+      "  commands: {",
+      "    bash: true",
+      "  },",
+      "  tools: {",
+      "    elevated: {",
+      "      enabled: true,",
+      `      allowFrom: { "${providerKey}": ["<sender-id>"] }`,
+      "    }",
+      "  }",
+      "}",
+      "```",
+      "Restart the Gateway after updating config.",
+    ].join("\n"),
+  };
+}
+
 function formatElevatedUnavailableMessage(params: {
   runtimeSandboxed: boolean;
   failures: Array<{ gate: string; key: string }>;
@@ -199,9 +223,13 @@ export async function handleBashChatCommand(params: {
   };
 }): Promise<ReplyPayload> {
   if (params.cfg.commands?.bash !== true) {
-    return {
-      text: "⚠️ bash is disabled. Set commands.bash=true to enable.",
-    };
+    logVerbose("Blocked /bash: commands.bash is disabled.");
+    const provider =
+      params.ctx.Provider ??
+      params.ctx.Surface ??
+      params.ctx.OriginatingChannel ??
+      undefined;
+    return buildBashDisabledReply(provider ?? undefined);
   }
 
   const agentId =
