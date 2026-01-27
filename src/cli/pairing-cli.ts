@@ -131,6 +131,9 @@ export function registerPairingCli(program: Command) {
       if (!approved) {
         throw new Error(`No pending pairing request found for code: ${String(resolvedCode)}`);
       }
+      if ("rateLimited" in approved) {
+        throw new Error(`Too many pairing attempts. Please wait a moment and try again.`);
+      }
 
       defaultRuntime.log(
         `${theme.success("Approved")} ${theme.muted(channel)} sender ${theme.command(approved.id)}.`,

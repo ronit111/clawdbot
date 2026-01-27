@@ -2,13 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   analyzeArgvCommand,
   analyzeShellCommand,
+  clearPendingNonces,
   evaluateExecAllowlist,
   evaluateShellAllowlist,
+  generateApprovalNonce,
+  getPendingNonceCount,
+  isNonceValid,
   isSafeBinUsage,
   matchAllowlist,
   maxAsk,
@@ -18,6 +22,7 @@ import {
   resolveCommandResolution,
   resolveExecApprovals,
   resolveExecApprovalsFromFile,
+  verifyAndConsumeNonce,
   type ExecAllowlistEntry,
 } from "./exec-approvals.js";
 
@@ -527,5 +532,94 @@ describe("exec approvals default agent migration", () => {
     expect(resolved.agent.ask).toBe("always");
     expect(resolved.allowlist.map((entry) => entry.pattern)).toEqual(["/bin/main", "/bin/legacy"]);
     expect(resolved.file.agents?.default).toBeUndefined();
+  });
+});
+
+describe("exec approvals one-time-use nonces", () => {
+  afterEach(() => {
+    clearPendingNonces();
+  });
+
+  it("generates unique nonces", () => {
+    const nonce1 = generateApprovalNonce();
+    const nonce2 = generateApprovalNonce();
+    expect(nonce1).not.toBe(nonce2);
+    expect(nonce1).toHaveLength(43); // base64url of 32 bytes
+    expect(nonce2).toHaveLength(43);
+  });
+
+  it("tracks pending nonces", () => {
+    expect(getPendingNonceCount()).toBe(0);
+    generateApprovalNonce();
+    expect(getPendingNonceCount()).toBe(1);
+    generateApprovalNonce();
+    expect(getPendingNonceCount()).toBe(2);
+  });
+
+  it("validates valid nonces", () => {
+    const nonce = generateApprovalNonce();
+    expect(isNonceValid(nonce)).toBe(true);
+    expect(isNonceValid("invalid-nonce")).toBe(false);
+  });
+
+  it("consumes nonces on verification", () => {
+    const nonce = generateApprovalNonce();
+
+    // First verification should succeed
+    expect(verifyAndConsumeNonce(nonce)).toBe(true);
+
+    // Second verification should fail (replay attack)
+    expect(verifyAndConsumeNonce(nonce)).toBe(false);
+    expect(isNonceValid(nonce)).toBe(false);
+  });
+
+  it("rejects unknown nonces", () => {
+    expect(verifyAndConsumeNonce("unknown-nonce")).toBe(false);
+    expect(isNonceValid("unknown-nonce")).toBe(false);
+  });
+
+  it("rejects already consumed nonces (replay protection)", () => {
+    const nonce = generateApprovalNonce();
+
+    // Consume the nonce
+    verifyAndConsumeNonce(nonce);
+
+    // Try to replay - should be rejected
+    expect(verifyAndConsumeNonce(nonce)).toBe(false);
+    expect(verifyAndConsumeNonce(nonce)).toBe(false);
+    expect(verifyAndConsumeNonce(nonce)).toBe(false);
+  });
+
+  it("clears all pending nonces", () => {
+    generateApprovalNonce();
+    generateApprovalNonce();
+    generateApprovalNonce();
+    expect(getPendingNonceCount()).toBe(3);
+
+    clearPendingNonces();
+    expect(getPendingNonceCount()).toBe(0);
+  });
+
+  it("multiple nonces can be active simultaneously", () => {
+    const nonces = [generateApprovalNonce(), generateApprovalNonce(), generateApprovalNonce()];
+
+    // All should be valid
+    for (const nonce of nonces) {
+      expect(isNonceValid(nonce)).toBe(true);
+    }
+
+    // Consume one at a time
+    expect(verifyAndConsumeNonce(nonces[1])).toBe(true);
+    expect(isNonceValid(nonces[0])).toBe(true);
+    expect(isNonceValid(nonces[1])).toBe(false);
+    expect(isNonceValid(nonces[2])).toBe(true);
+
+    expect(verifyAndConsumeNonce(nonces[0])).toBe(true);
+    expect(verifyAndConsumeNonce(nonces[2])).toBe(true);
+
+    // All consumed
+    for (const nonce of nonces) {
+      expect(isNonceValid(nonce)).toBe(false);
+    }
   });
 });

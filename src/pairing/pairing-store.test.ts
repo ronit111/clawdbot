@@ -6,7 +6,11 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { resolveOAuthDir } from "../config/paths.js";
-import { listChannelPairingRequests, upsertChannelPairingRequest } from "./pairing-store.js";
+import {
+  approveChannelPairingCode,
+  listChannelPairingRequests,
+  upsertChannelPairingRequest,
+} from "./pairing-store.js";
 
 async function withTempStateDir<T>(fn: (stateDir: string) => Promise<T>) {
   const previous = process.env.CLAWDBOT_STATE_DIR;
@@ -88,16 +92,18 @@ describe("pairing store", () => {
           channel: "telegram",
           id: "123",
         });
-        expect(first.code).toBe("AAAAAAAA");
+        // SECURITY: Codes are now 16 chars for 80-bit entropy (up from 8 chars / 40 bits)
+        expect(first.code).toBe("AAAAAAAAAAAAAAAA");
 
-        const sequence = Array(8).fill(0).concat(Array(8).fill(1));
+        // Generate 16 A's (collides), then 16 B's (unique)
+        const sequence = Array(16).fill(0).concat(Array(16).fill(1));
         let idx = 0;
         spy.mockImplementation(() => sequence[idx++] ?? 1);
         const second = await upsertChannelPairingRequest({
           channel: "telegram",
           id: "456",
         });
-        expect(second.code).toBe("BBBBBBBB");
+        expect(second.code).toBe("BBBBBBBBBBBBBBBB");
       } finally {
         spy.mockRestore();
       }
@@ -128,6 +134,159 @@ describe("pairing store", () => {
       expect(listIds).toContain("+15550000002");
       expect(listIds).toContain("+15550000003");
       expect(listIds).not.toContain("+15550000004");
+    });
+  });
+
+  it("generates 16-character codes for 80-bit entropy", async () => {
+    await withTempStateDir(async () => {
+      const result = await upsertChannelPairingRequest({
+        channel: "discord",
+        id: "security-test-user",
+      });
+      expect(result.code).toHaveLength(16);
+      // Verify all characters are from the allowed alphabet
+      const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+      for (const char of result.code) {
+        expect(alphabet).toContain(char);
+      }
+    });
+  });
+});
+
+describe("pairing store security", () => {
+  it("approves valid pairing code", async () => {
+    await withTempStateDir(async () => {
+      const created = await upsertChannelPairingRequest({
+        channel: "discord",
+        id: "test-user-1",
+      });
+      expect(created.created).toBe(true);
+
+      const result = await approveChannelPairingCode({
+        channel: "discord",
+        code: created.code,
+      });
+      expect(result).not.toBeNull();
+      expect(result).not.toHaveProperty("rateLimited");
+      expect((result as { id: string }).id).toBe("test-user-1");
+
+      // Code should be consumed - list should be empty
+      const list = await listChannelPairingRequests("discord");
+      expect(list).toHaveLength(0);
+    });
+  });
+
+  it("returns null for invalid pairing code", async () => {
+    await withTempStateDir(async () => {
+      await upsertChannelPairingRequest({
+        channel: "discord",
+        id: "test-user-1",
+      });
+
+      const result = await approveChannelPairingCode({
+        channel: "discord",
+        code: "INVALIDCODEINVALID",
+      });
+      expect(result).toBeNull();
+    });
+  });
+
+  it("detects tampering via signature verification", async () => {
+    await withTempStateDir(async (stateDir) => {
+      // Create a pairing request
+      const created = await upsertChannelPairingRequest({
+        channel: "signal",
+        id: "+15551234567",
+      });
+      expect(created.created).toBe(true);
+
+      // Tamper with the store directly
+      const oauthDir = resolveOAuthDir(process.env, stateDir);
+      const filePath = path.join(oauthDir, "signal-pairing.json");
+      const raw = await fs.readFile(filePath, "utf8");
+      const parsed = JSON.parse(raw) as {
+        version: number;
+        requests: Array<{ id: string; code: string }>;
+        signature?: string;
+      };
+
+      // Modify a request without updating the signature
+      if (parsed.requests[0]) {
+        parsed.requests[0].code = "TAMPEREDCODETAMP";
+      }
+      await fs.writeFile(filePath, JSON.stringify(parsed, null, 2), "utf8");
+
+      // Reading should detect tampering and reset the store
+      const list = await listChannelPairingRequests("signal");
+      expect(list).toHaveLength(0);
+    });
+  });
+
+  it("rate limits excessive pairing approval attempts", async () => {
+    await withTempStateDir(async () => {
+      await upsertChannelPairingRequest({
+        channel: "telegram",
+        id: "rate-limit-test",
+      });
+
+      // Make many failed attempts (rate limit is 10 per minute)
+      const results: Awaited<ReturnType<typeof approveChannelPairingCode>>[] = [];
+      for (let i = 0; i < 12; i++) {
+        const result = await approveChannelPairingCode({
+          channel: "telegram",
+          code: `INVALID${i}CODEXXXX`,
+        });
+        results.push(result);
+      }
+
+      // First 10 should return null (invalid code)
+      for (let i = 0; i < 10; i++) {
+        expect(results[i]).toBeNull();
+      }
+
+      // After 10 attempts, should be rate limited
+      expect(results[10]).toEqual({ rateLimited: true });
+      expect(results[11]).toEqual({ rateLimited: true });
+    });
+  });
+
+  it("handles case-insensitive code matching", async () => {
+    await withTempStateDir(async () => {
+      const created = await upsertChannelPairingRequest({
+        channel: "discord",
+        id: "case-test-user",
+      });
+
+      // Try with lowercase
+      const result = await approveChannelPairingCode({
+        channel: "discord",
+        code: created.code.toLowerCase(),
+      });
+      expect(result).not.toBeNull();
+      expect(result).not.toHaveProperty("rateLimited");
+    });
+  });
+
+  it("stores are signed on write", async () => {
+    await withTempStateDir(async (stateDir) => {
+      await upsertChannelPairingRequest({
+        channel: "slack",
+        id: "signature-test",
+      });
+
+      const oauthDir = resolveOAuthDir(process.env, stateDir);
+      const filePath = path.join(oauthDir, "slack-pairing.json");
+      const raw = await fs.readFile(filePath, "utf8");
+      const parsed = JSON.parse(raw) as {
+        version: number;
+        requests: unknown[];
+        signature?: string;
+      };
+
+      // Should have a signature
+      expect(parsed.signature).toBeDefined();
+      expect(typeof parsed.signature).toBe("string");
+      expect(parsed.signature).toHaveLength(64); // SHA-256 hex = 64 chars
     });
   });
 });
