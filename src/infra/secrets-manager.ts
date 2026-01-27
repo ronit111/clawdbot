@@ -563,3 +563,170 @@ export function verifySecretHash(secret: string, hash: string): boolean {
   const computed = hashSecret(secret);
   return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(hash));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FILE ENCRYPTION UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Encrypts a file in place, creating a .enc version.
+ * The original file can be optionally removed for security.
+ *
+ * @returns Path to the encrypted file, or null on failure
+ */
+export function encryptFile(
+  filePath: string,
+  opts: { removeOriginal?: boolean; password?: string } = {},
+): string | null {
+  try {
+    if (!fs.existsSync(filePath)) {
+      log.warn("Cannot encrypt non-existent file", { filePath });
+      return null;
+    }
+
+    const content = fs.readFileSync(filePath, "utf8");
+    const encrypted = encryptData(content, opts.password);
+    const encryptedPath = `${filePath}.enc`;
+
+    fs.writeFileSync(encryptedPath, encrypted, { mode: 0o600 });
+
+    if (opts.removeOriginal) {
+      fs.unlinkSync(filePath);
+    }
+
+    log.info("Encrypted file", { filePath, encryptedPath });
+    return encryptedPath;
+  } catch (err) {
+    log.error("Failed to encrypt file", { filePath, error: String(err) });
+    return null;
+  }
+}
+
+/**
+ * Decrypts a .enc file back to its original form.
+ * The encrypted file can be optionally removed after decryption.
+ *
+ * @returns The decrypted content, or null on failure
+ */
+export function decryptFile(
+  encryptedPath: string,
+  opts: { removeEncrypted?: boolean; password?: string } = {},
+): string | null {
+  try {
+    if (!fs.existsSync(encryptedPath)) {
+      log.warn("Cannot decrypt non-existent file", { encryptedPath });
+      return null;
+    }
+
+    const encrypted = fs.readFileSync(encryptedPath);
+    const content = decryptData(encrypted, opts.password);
+
+    if (opts.removeEncrypted) {
+      fs.unlinkSync(encryptedPath);
+    }
+
+    return content;
+  } catch (err) {
+    log.error("Failed to decrypt file", { encryptedPath, error: String(err) });
+    return null;
+  }
+}
+
+/**
+ * Reads a file that may be encrypted or plaintext.
+ * If the .enc version exists, decrypts it. Otherwise reads the plaintext version.
+ *
+ * @returns Object with content and whether it was encrypted
+ */
+export function readPossiblyEncryptedFile(
+  basePath: string,
+  opts: { password?: string } = {},
+): { content: string | null; encrypted: boolean } {
+  const encryptedPath = `${basePath}.enc`;
+
+  // Prefer encrypted version if it exists
+  if (fs.existsSync(encryptedPath)) {
+    const content = decryptFile(encryptedPath, opts);
+    return { content, encrypted: true };
+  }
+
+  // Fall back to plaintext
+  if (fs.existsSync(basePath)) {
+    try {
+      const content = fs.readFileSync(basePath, "utf8");
+      return { content, encrypted: false };
+    } catch (err) {
+      log.error("Failed to read plaintext file", { basePath, error: String(err) });
+      return { content: null, encrypted: false };
+    }
+  }
+
+  return { content: null, encrypted: false };
+}
+
+/**
+ * Writes a file encrypted. If a plaintext version exists, can migrate it.
+ *
+ * @returns Path to the encrypted file, or null on failure
+ */
+export function writePossiblyEncryptedFile(
+  basePath: string,
+  content: string,
+  opts: { encrypt?: boolean; password?: string; removePlaintext?: boolean } = {},
+): string | null {
+  try {
+    if (opts.encrypt !== false) {
+      // Write encrypted version
+      const encryptedPath = `${basePath}.enc`;
+      const encrypted = encryptData(content, opts.password);
+      const dir = path.dirname(encryptedPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      }
+      fs.writeFileSync(encryptedPath, encrypted, { mode: 0o600 });
+
+      // Optionally remove plaintext version
+      if (opts.removePlaintext && fs.existsSync(basePath)) {
+        fs.unlinkSync(basePath);
+      }
+
+      return encryptedPath;
+    } else {
+      // Write plaintext (for compatibility)
+      const dir = path.dirname(basePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      }
+      fs.writeFileSync(basePath, content, { mode: 0o600 });
+      return basePath;
+    }
+  } catch (err) {
+    log.error("Failed to write file", { basePath, error: String(err) });
+    return null;
+  }
+}
+
+/**
+ * Migrates an existing plaintext file to encrypted storage.
+ *
+ * @returns Path to the encrypted file, or null if migration failed or wasn't needed
+ */
+export function migrateFileToEncrypted(
+  filePath: string,
+  opts: { removeOriginal?: boolean; password?: string } = {},
+): string | null {
+  const encryptedPath = `${filePath}.enc`;
+
+  // Already encrypted
+  if (fs.existsSync(encryptedPath)) {
+    log.info("File already encrypted", { filePath });
+    return encryptedPath;
+  }
+
+  // No plaintext to migrate
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  return encryptFile(filePath, opts);
+}

@@ -1,14 +1,14 @@
 import type { ClawdbotConfig } from "../config/config.js";
 import type { DiscordAccountConfig } from "../config/types.js";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../routing/session-key.js";
-import { resolveDiscordToken } from "./token.js";
+import { resolveDiscordToken, type DiscordTokenSource } from "./token.js";
 
 export type ResolvedDiscordAccount = {
   accountId: string;
   enabled: boolean;
   name?: string;
   token: string;
-  tokenSource: "env" | "config" | "none";
+  tokenSource: DiscordTokenSource;
   config: DiscordAccountConfig;
 };
 

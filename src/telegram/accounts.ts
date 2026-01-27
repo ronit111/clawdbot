@@ -3,7 +3,7 @@ import type { TelegramAccountConfig } from "../config/types.js";
 import { isTruthyEnvValue } from "../infra/env.js";
 import { listBoundAccountIds, resolveDefaultAgentBoundAccountId } from "../routing/bindings.js";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../routing/session-key.js";
-import { resolveTelegramToken } from "./token.js";
+import { resolveTelegramToken, type TelegramTokenSource } from "./token.js";
 
 const debugAccounts = (...args: unknown[]) => {
   if (isTruthyEnvValue(process.env.CLAWDBOT_DEBUG_TELEGRAM_ACCOUNTS)) {
@@ -16,7 +16,7 @@ export type ResolvedTelegramAccount = {
   enabled: boolean;
   name?: string;
   token: string;
-  tokenSource: "env" | "tokenFile" | "config" | "none";
+  tokenSource: TelegramTokenSource;
   config: TelegramAccountConfig;
 };
 
