@@ -22,12 +22,7 @@ import {
 } from "./embeddings.js";
 import { DEFAULT_GEMINI_EMBEDDING_MODEL } from "./embeddings-gemini.js";
 import { DEFAULT_OPENAI_EMBEDDING_MODEL } from "./embeddings-openai.js";
-import {
-  OPENAI_BATCH_ENDPOINT,
-  type OpenAiBatchRequest,
-  runOpenAiEmbeddingBatches,
-} from "./batch-openai.js";
-import { runGeminiEmbeddingBatches, type GeminiBatchRequest } from "./batch-gemini.js";
+import { EmbeddingService, type EmbeddingServiceConfig } from "./embedding-service.js";
 import {
   buildFileEntry,
   chunkMarkdown,
@@ -35,10 +30,8 @@ import {
   hashText,
   isMemoryPath,
   listMemoryFiles,
-  type MemoryChunk,
   type MemoryFileEntry,
   normalizeRelPath,
-  parseEmbedding,
 } from "./internal.js";
 import { bm25RankToScore, buildFtsQuery, mergeHybridResults } from "./hybrid.js";
 import { searchKeyword, searchVector } from "./manager-search.js";
@@ -94,19 +87,9 @@ const VECTOR_TABLE = "chunks_vec";
 const FTS_TABLE = "chunks_fts";
 const EMBEDDING_CACHE_TABLE = "embedding_cache";
 const SESSION_DIRTY_DEBOUNCE_MS = 5000;
-const EMBEDDING_BATCH_MAX_TOKENS = 8000;
-const EMBEDDING_APPROX_CHARS_PER_TOKEN = 1;
 const EMBEDDING_INDEX_CONCURRENCY = 4;
-const EMBEDDING_RETRY_MAX_ATTEMPTS = 3;
-const EMBEDDING_RETRY_BASE_DELAY_MS = 500;
-const EMBEDDING_RETRY_MAX_DELAY_MS = 8000;
-const BATCH_FAILURE_LIMIT = 2;
 const SESSION_DELTA_READ_CHUNK_BYTES = 64 * 1024;
 const VECTOR_LOAD_TIMEOUT_MS = 30_000;
-const EMBEDDING_QUERY_TIMEOUT_REMOTE_MS = 60_000;
-const EMBEDDING_QUERY_TIMEOUT_LOCAL_MS = 5 * 60_000;
-const EMBEDDING_BATCH_TIMEOUT_REMOTE_MS = 2 * 60_000;
-const EMBEDDING_BATCH_TIMEOUT_LOCAL_MS = 10 * 60_000;
 
 const log = createSubsystemLogger("memory");
 
@@ -127,17 +110,7 @@ export class MemoryIndexManager {
   private fallbackReason?: string;
   private openAi?: OpenAiEmbeddingClient;
   private gemini?: GeminiEmbeddingClient;
-  private batch: {
-    enabled: boolean;
-    wait: boolean;
-    concurrency: number;
-    pollIntervalMs: number;
-    timeoutMs: number;
-  };
-  private batchFailureCount = 0;
-  private batchFailureLastError?: string;
-  private batchFailureLastProvider?: string;
-  private batchFailureLock: Promise<void> = Promise.resolve();
+  private embeddingService: EmbeddingService;
   private db: DatabaseSync;
   private readonly sources: Set<MemorySource>;
   private providerKey: string;
@@ -245,7 +218,7 @@ export class MemoryIndexManager {
     this.ensureSessionListener();
     this.ensureIntervalSync();
     this.dirty = this.sources.has("memory");
-    this.batch = this.resolveBatchConfig();
+    this.embeddingService = this.createEmbeddingService();
   }
 
   async warmSession(sessionKey?: string): Promise<void> {
@@ -286,7 +259,7 @@ export class MemoryIndexManager {
       ? await this.searchKeyword(cleaned, candidates).catch(() => [])
       : [];
 
-    const queryVec = await this.embedQueryWithTimeout(cleaned);
+    const queryVec = await this.embeddingService.embedQuery(cleaned);
     const hasVector = queryVec.some((v) => v !== 0);
     const vectorResults = hasVector
       ? await this.searchVector(queryVec, candidates).catch(() => [])
@@ -502,12 +475,7 @@ export class MemoryIndexManager {
       cache: this.cache.enabled
         ? {
             enabled: true,
-            entries:
-              (
-                this.db.prepare(`SELECT COUNT(*) as c FROM ${EMBEDDING_CACHE_TABLE}`).get() as
-                  | { c: number }
-                  | undefined
-              )?.c ?? 0,
+            entries: this.embeddingService.getCacheEntryCount(),
             maxEntries: this.cache.maxEntries,
           }
         : { enabled: false, maxEntries: this.cache.maxEntries },
@@ -526,17 +494,7 @@ export class MemoryIndexManager {
         loadError: this.vector.loadError,
         dims: this.vector.dims,
       },
-      batch: {
-        enabled: this.batch.enabled,
-        failures: this.batchFailureCount,
-        limit: BATCH_FAILURE_LIMIT,
-        wait: this.batch.wait,
-        concurrency: this.batch.concurrency,
-        pollIntervalMs: this.batch.pollIntervalMs,
-        timeoutMs: this.batch.timeoutMs,
-        lastError: this.batchFailureLastError,
-        lastProvider: this.batchFailureLastProvider,
-      },
+      batch: this.embeddingService.getBatchStatus(),
     };
   }
 
@@ -547,7 +505,9 @@ export class MemoryIndexManager {
 
   async probeEmbeddingAvailability(): Promise<{ ok: boolean; error?: string }> {
     try {
-      await this.embedBatchWithRetry(["ping"]);
+      await this.embeddingService.embedChunksInBatches([
+        { text: "ping", hash: "probe", startLine: 0, endLine: 0 },
+      ]);
       return { ok: true };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -673,52 +633,6 @@ export class MemoryIndexManager {
     ensureDir(dir);
     const { DatabaseSync } = requireNodeSqlite();
     return new DatabaseSync(dbPath, { allowExtension: this.settings.store.vector.enabled });
-  }
-
-  private seedEmbeddingCache(sourceDb: DatabaseSync): void {
-    if (!this.cache.enabled) return;
-    try {
-      const rows = sourceDb
-        .prepare(
-          `SELECT provider, model, provider_key, hash, embedding, dims, updated_at FROM ${EMBEDDING_CACHE_TABLE}`,
-        )
-        .all() as Array<{
-        provider: string;
-        model: string;
-        provider_key: string;
-        hash: string;
-        embedding: string;
-        dims: number | null;
-        updated_at: number;
-      }>;
-      if (!rows.length) return;
-      const insert = this.db.prepare(
-        `INSERT INTO ${EMBEDDING_CACHE_TABLE} (provider, model, provider_key, hash, embedding, dims, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(provider, model, provider_key, hash) DO UPDATE SET
-           embedding=excluded.embedding,
-           dims=excluded.dims,
-           updated_at=excluded.updated_at`,
-      );
-      this.db.exec("BEGIN");
-      for (const row of rows) {
-        insert.run(
-          row.provider,
-          row.model,
-          row.provider_key,
-          row.hash,
-          row.embedding,
-          row.dims,
-          row.updated_at,
-        );
-      }
-      this.db.exec("COMMIT");
-    } catch (err) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch {}
-      throw err;
-    }
   }
 
   private async swapIndexFiles(targetPath: string, tempPath: string): Promise<void> {
@@ -979,11 +893,13 @@ export class MemoryIndexManager {
     const fileEntries = await Promise.all(
       files.map(async (file) => buildFileEntry(file, this.workspaceDir)),
     );
+    const batchEnabled = this.embeddingService.isBatchEnabled();
+    const concurrency = this.embeddingService.getIndexConcurrency(EMBEDDING_INDEX_CONCURRENCY);
     log.debug("memory sync: indexing memory files", {
       files: fileEntries.length,
       needsFullReindex: params.needsFullReindex,
-      batch: this.batch.enabled,
-      concurrency: this.getIndexConcurrency(),
+      batch: batchEnabled,
+      concurrency,
     });
     const activePaths = new Set(fileEntries.map((entry) => entry.path));
     if (params.progress) {
@@ -991,7 +907,7 @@ export class MemoryIndexManager {
       params.progress.report({
         completed: params.progress.completed,
         total: params.progress.total,
-        label: this.batch.enabled ? "Indexing memory files (batch)..." : "Indexing memory files…",
+        label: batchEnabled ? "Indexing memory files (batch)..." : "Indexing memory files…",
       });
     }
 
@@ -1018,7 +934,7 @@ export class MemoryIndexManager {
         });
       }
     });
-    await this.runWithConcurrency(tasks, this.getIndexConcurrency());
+    await this.runWithConcurrency(tasks, concurrency);
 
     const staleRows = this.db
       .prepare(`SELECT path FROM files WHERE source = ?`)
@@ -1051,19 +967,21 @@ export class MemoryIndexManager {
     const files = await this.listSessionFiles();
     const activePaths = new Set(files.map((file) => this.sessionPathForFile(file)));
     const indexAll = params.needsFullReindex || this.sessionsDirtyFiles.size === 0;
+    const batchEnabled = this.embeddingService.isBatchEnabled();
+    const concurrency = this.embeddingService.getIndexConcurrency(EMBEDDING_INDEX_CONCURRENCY);
     log.debug("memory sync: indexing session files", {
       files: files.length,
       indexAll,
       dirtyFiles: this.sessionsDirtyFiles.size,
-      batch: this.batch.enabled,
-      concurrency: this.getIndexConcurrency(),
+      batch: batchEnabled,
+      concurrency,
     });
     if (params.progress) {
       params.progress.total += files.length;
       params.progress.report({
         completed: params.progress.completed,
         total: params.progress.total,
-        label: this.batch.enabled ? "Indexing session files (batch)..." : "Indexing session files…",
+        label: batchEnabled ? "Indexing session files (batch)..." : "Indexing session files…",
       });
     }
 
@@ -1113,7 +1031,7 @@ export class MemoryIndexManager {
         });
       }
     });
-    await this.runWithConcurrency(tasks, this.getIndexConcurrency());
+    await this.runWithConcurrency(tasks, concurrency);
 
     const staleRows = this.db
       .prepare(`SELECT path FROM files WHERE source = ?`)
@@ -1238,26 +1156,29 @@ export class MemoryIndexManager {
     return /embedding|embeddings|batch/i.test(message);
   }
 
-  private resolveBatchConfig(): {
-    enabled: boolean;
-    wait: boolean;
-    concurrency: number;
-    pollIntervalMs: number;
-    timeoutMs: number;
-  } {
+  private createEmbeddingService(): EmbeddingService {
     const batch = this.settings.remote?.batch;
     const enabled = Boolean(
       batch?.enabled &&
       ((this.openAi && this.provider.id === "openai") ||
         (this.gemini && this.provider.id === "gemini")),
     );
-    return {
-      enabled,
-      wait: batch?.wait ?? true,
-      concurrency: Math.max(1, batch?.concurrency ?? 2),
-      pollIntervalMs: batch?.pollIntervalMs ?? 2000,
-      timeoutMs: (batch?.timeoutMinutes ?? 60) * 60 * 1000,
+    const config: EmbeddingServiceConfig = {
+      provider: this.provider,
+      providerKey: this.providerKey,
+      openAi: this.openAi,
+      gemini: this.gemini,
+      cache: this.cache,
+      batch: {
+        enabled,
+        wait: batch?.wait ?? true,
+        concurrency: Math.max(1, batch?.concurrency ?? 2),
+        pollIntervalMs: batch?.pollIntervalMs ?? 2000,
+        timeoutMs: (batch?.timeoutMinutes ?? 60) * 60 * 1000,
+      },
+      agentId: this.agentId,
     };
+    return new EmbeddingService(this.db, config);
   }
 
   private async activateFallbackProvider(reason: string): Promise<boolean> {
@@ -1289,7 +1210,7 @@ export class MemoryIndexManager {
     this.openAi = fallbackResult.openAi;
     this.gemini = fallbackResult.gemini;
     this.providerKey = this.computeProviderKey();
-    this.batch = this.resolveBatchConfig();
+    this.embeddingService = this.createEmbeddingService();
     log.warn(`memory embeddings: switched to fallback provider (${fallback})`, { reason });
     return true;
   }
@@ -1320,6 +1241,7 @@ export class MemoryIndexManager {
       } else {
         this.db = originalDb;
       }
+      this.embeddingService = this.createEmbeddingService();
       this.fts.available = originalState.ftsAvailable;
       this.fts.loadError = originalState.ftsError;
       this.vector.available = originalDbClosed ? null : originalState.vectorAvailable;
@@ -1329,6 +1251,7 @@ export class MemoryIndexManager {
     };
 
     this.db = tempDb;
+    this.embeddingService = this.createEmbeddingService();
     this.vectorReady = null;
     this.vector.available = null;
     this.vector.loadError = undefined;
@@ -1340,7 +1263,7 @@ export class MemoryIndexManager {
     let nextMeta: MemoryIndexMeta | null = null;
 
     try {
-      this.seedEmbeddingCache(originalDb);
+      this.embeddingService.seedEmbeddingCache(originalDb);
       const shouldSyncMemory = this.sources.has("memory");
       const shouldSyncSessions = this.shouldSyncSessions(
         { reason: params.reason, force: params.force },
@@ -1374,7 +1297,7 @@ export class MemoryIndexManager {
       }
 
       this.writeMeta(nextMeta);
-      this.pruneEmbeddingCacheIfNeeded();
+      this.embeddingService.pruneEmbeddingCacheIfNeeded();
 
       this.db.close();
       originalDb.close();
@@ -1383,6 +1306,7 @@ export class MemoryIndexManager {
       await this.swapIndexFiles(dbPath, tempDbPath);
 
       this.db = this.openDatabaseAtPath(dbPath);
+      this.embeddingService = this.createEmbeddingService();
       this.vectorReady = null;
       this.vector.available = null;
       this.vector.loadError = undefined;
@@ -1521,157 +1445,6 @@ export class MemoryIndexManager {
     }
   }
 
-  private estimateEmbeddingTokens(text: string): number {
-    if (!text) return 0;
-    return Math.ceil(text.length / EMBEDDING_APPROX_CHARS_PER_TOKEN);
-  }
-
-  private buildEmbeddingBatches(chunks: MemoryChunk[]): MemoryChunk[][] {
-    const batches: MemoryChunk[][] = [];
-    let current: MemoryChunk[] = [];
-    let currentTokens = 0;
-
-    for (const chunk of chunks) {
-      const estimate = this.estimateEmbeddingTokens(chunk.text);
-      const wouldExceed =
-        current.length > 0 && currentTokens + estimate > EMBEDDING_BATCH_MAX_TOKENS;
-      if (wouldExceed) {
-        batches.push(current);
-        current = [];
-        currentTokens = 0;
-      }
-      if (current.length === 0 && estimate > EMBEDDING_BATCH_MAX_TOKENS) {
-        batches.push([chunk]);
-        continue;
-      }
-      current.push(chunk);
-      currentTokens += estimate;
-    }
-
-    if (current.length > 0) {
-      batches.push(current);
-    }
-    return batches;
-  }
-
-  private loadEmbeddingCache(hashes: string[]): Map<string, number[]> {
-    if (!this.cache.enabled) return new Map();
-    if (hashes.length === 0) return new Map();
-    const unique: string[] = [];
-    const seen = new Set<string>();
-    for (const hash of hashes) {
-      if (!hash) continue;
-      if (seen.has(hash)) continue;
-      seen.add(hash);
-      unique.push(hash);
-    }
-    if (unique.length === 0) return new Map();
-
-    const out = new Map<string, number[]>();
-    const baseParams = [this.provider.id, this.provider.model, this.providerKey];
-    const batchSize = 400;
-    for (let start = 0; start < unique.length; start += batchSize) {
-      const batch = unique.slice(start, start + batchSize);
-      const placeholders = batch.map(() => "?").join(", ");
-      const rows = this.db
-        .prepare(
-          `SELECT hash, embedding FROM ${EMBEDDING_CACHE_TABLE}\n` +
-            ` WHERE provider = ? AND model = ? AND provider_key = ? AND hash IN (${placeholders})`,
-        )
-        .all(...baseParams, ...batch) as Array<{ hash: string; embedding: string }>;
-      for (const row of rows) {
-        out.set(row.hash, parseEmbedding(row.embedding));
-      }
-    }
-    return out;
-  }
-
-  private upsertEmbeddingCache(entries: Array<{ hash: string; embedding: number[] }>): void {
-    if (!this.cache.enabled) return;
-    if (entries.length === 0) return;
-    const now = Date.now();
-    const stmt = this.db.prepare(
-      `INSERT INTO ${EMBEDDING_CACHE_TABLE} (provider, model, provider_key, hash, embedding, dims, updated_at)\n` +
-        ` VALUES (?, ?, ?, ?, ?, ?, ?)\n` +
-        ` ON CONFLICT(provider, model, provider_key, hash) DO UPDATE SET\n` +
-        `   embedding=excluded.embedding,\n` +
-        `   dims=excluded.dims,\n` +
-        `   updated_at=excluded.updated_at`,
-    );
-    for (const entry of entries) {
-      const embedding = entry.embedding ?? [];
-      stmt.run(
-        this.provider.id,
-        this.provider.model,
-        this.providerKey,
-        entry.hash,
-        JSON.stringify(embedding),
-        embedding.length,
-        now,
-      );
-    }
-  }
-
-  private pruneEmbeddingCacheIfNeeded(): void {
-    if (!this.cache.enabled) return;
-    const max = this.cache.maxEntries;
-    if (!max || max <= 0) return;
-    const row = this.db.prepare(`SELECT COUNT(*) as c FROM ${EMBEDDING_CACHE_TABLE}`).get() as
-      | { c: number }
-      | undefined;
-    const count = row?.c ?? 0;
-    if (count <= max) return;
-    const excess = count - max;
-    this.db
-      .prepare(
-        `DELETE FROM ${EMBEDDING_CACHE_TABLE}\n` +
-          ` WHERE rowid IN (\n` +
-          `   SELECT rowid FROM ${EMBEDDING_CACHE_TABLE}\n` +
-          `   ORDER BY updated_at ASC\n` +
-          `   LIMIT ?\n` +
-          ` )`,
-      )
-      .run(excess);
-  }
-
-  private async embedChunksInBatches(chunks: MemoryChunk[]): Promise<number[][]> {
-    if (chunks.length === 0) return [];
-    const cached = this.loadEmbeddingCache(chunks.map((chunk) => chunk.hash));
-    const embeddings: number[][] = Array.from({ length: chunks.length }, () => []);
-    const missing: Array<{ index: number; chunk: MemoryChunk }> = [];
-
-    for (let i = 0; i < chunks.length; i += 1) {
-      const chunk = chunks[i];
-      const hit = chunk?.hash ? cached.get(chunk.hash) : undefined;
-      if (hit && hit.length > 0) {
-        embeddings[i] = hit;
-      } else if (chunk) {
-        missing.push({ index: i, chunk });
-      }
-    }
-
-    if (missing.length === 0) return embeddings;
-
-    const missingChunks = missing.map((m) => m.chunk);
-    const batches = this.buildEmbeddingBatches(missingChunks);
-    const toCache: Array<{ hash: string; embedding: number[] }> = [];
-    let cursor = 0;
-    for (const batch of batches) {
-      const batchEmbeddings = await this.embedBatchWithRetry(batch.map((chunk) => chunk.text));
-      for (let i = 0; i < batch.length; i += 1) {
-        const item = missing[cursor + i];
-        const embedding = batchEmbeddings[i] ?? [];
-        if (item) {
-          embeddings[item.index] = embedding;
-          toCache.push({ hash: item.chunk.hash, embedding });
-        }
-      }
-      cursor += batch.length;
-    }
-    this.upsertEmbeddingCache(toCache);
-    return embeddings;
-  }
-
   private computeProviderKey(): string {
     if (this.provider.id === "openai" && this.openAi) {
       const entries = Object.entries(this.openAi.headers)
@@ -1707,238 +1480,6 @@ export class MemoryIndexManager {
     return hashText(JSON.stringify({ provider: this.provider.id, model: this.provider.model }));
   }
 
-  private async embedChunksWithBatch(
-    chunks: MemoryChunk[],
-    entry: MemoryFileEntry | SessionFileEntry,
-    source: MemorySource,
-  ): Promise<number[][]> {
-    if (this.provider.id === "openai" && this.openAi) {
-      return this.embedChunksWithOpenAiBatch(chunks, entry, source);
-    }
-    if (this.provider.id === "gemini" && this.gemini) {
-      return this.embedChunksWithGeminiBatch(chunks, entry, source);
-    }
-    return this.embedChunksInBatches(chunks);
-  }
-
-  private async embedChunksWithOpenAiBatch(
-    chunks: MemoryChunk[],
-    entry: MemoryFileEntry | SessionFileEntry,
-    source: MemorySource,
-  ): Promise<number[][]> {
-    const openAi = this.openAi;
-    if (!openAi) {
-      return this.embedChunksInBatches(chunks);
-    }
-    if (chunks.length === 0) return [];
-    const cached = this.loadEmbeddingCache(chunks.map((chunk) => chunk.hash));
-    const embeddings: number[][] = Array.from({ length: chunks.length }, () => []);
-    const missing: Array<{ index: number; chunk: MemoryChunk }> = [];
-
-    for (let i = 0; i < chunks.length; i += 1) {
-      const chunk = chunks[i];
-      const hit = chunk?.hash ? cached.get(chunk.hash) : undefined;
-      if (hit && hit.length > 0) {
-        embeddings[i] = hit;
-      } else if (chunk) {
-        missing.push({ index: i, chunk });
-      }
-    }
-
-    if (missing.length === 0) return embeddings;
-
-    const requests: OpenAiBatchRequest[] = [];
-    const mapping = new Map<string, { index: number; hash: string }>();
-    for (const item of missing) {
-      const chunk = item.chunk;
-      const customId = hashText(
-        `${source}:${entry.path}:${chunk.startLine}:${chunk.endLine}:${chunk.hash}:${item.index}`,
-      );
-      mapping.set(customId, { index: item.index, hash: chunk.hash });
-      requests.push({
-        custom_id: customId,
-        method: "POST",
-        url: OPENAI_BATCH_ENDPOINT,
-        body: {
-          model: this.openAi?.model ?? this.provider.model,
-          input: chunk.text,
-        },
-      });
-    }
-    const batchResult = await this.runBatchWithFallback({
-      provider: "openai",
-      run: async () =>
-        await runOpenAiEmbeddingBatches({
-          openAi,
-          agentId: this.agentId,
-          requests,
-          wait: this.batch.wait,
-          concurrency: this.batch.concurrency,
-          pollIntervalMs: this.batch.pollIntervalMs,
-          timeoutMs: this.batch.timeoutMs,
-          debug: (message, data) => log.debug(message, { ...data, source, chunks: chunks.length }),
-        }),
-      fallback: async () => await this.embedChunksInBatches(chunks),
-    });
-    if (Array.isArray(batchResult)) return batchResult;
-    const byCustomId = batchResult;
-
-    const toCache: Array<{ hash: string; embedding: number[] }> = [];
-    for (const [customId, embedding] of byCustomId.entries()) {
-      const mapped = mapping.get(customId);
-      if (!mapped) continue;
-      embeddings[mapped.index] = embedding;
-      toCache.push({ hash: mapped.hash, embedding });
-    }
-    this.upsertEmbeddingCache(toCache);
-    return embeddings;
-  }
-
-  private async embedChunksWithGeminiBatch(
-    chunks: MemoryChunk[],
-    entry: MemoryFileEntry | SessionFileEntry,
-    source: MemorySource,
-  ): Promise<number[][]> {
-    const gemini = this.gemini;
-    if (!gemini) {
-      return this.embedChunksInBatches(chunks);
-    }
-    if (chunks.length === 0) return [];
-    const cached = this.loadEmbeddingCache(chunks.map((chunk) => chunk.hash));
-    const embeddings: number[][] = Array.from({ length: chunks.length }, () => []);
-    const missing: Array<{ index: number; chunk: MemoryChunk }> = [];
-
-    for (let i = 0; i < chunks.length; i += 1) {
-      const chunk = chunks[i];
-      const hit = chunk?.hash ? cached.get(chunk.hash) : undefined;
-      if (hit && hit.length > 0) {
-        embeddings[i] = hit;
-      } else if (chunk) {
-        missing.push({ index: i, chunk });
-      }
-    }
-
-    if (missing.length === 0) return embeddings;
-
-    const requests: GeminiBatchRequest[] = [];
-    const mapping = new Map<string, { index: number; hash: string }>();
-    for (const item of missing) {
-      const chunk = item.chunk;
-      const customId = hashText(
-        `${source}:${entry.path}:${chunk.startLine}:${chunk.endLine}:${chunk.hash}:${item.index}`,
-      );
-      mapping.set(customId, { index: item.index, hash: chunk.hash });
-      requests.push({
-        custom_id: customId,
-        content: { parts: [{ text: chunk.text }] },
-        taskType: "RETRIEVAL_DOCUMENT",
-      });
-    }
-
-    const batchResult = await this.runBatchWithFallback({
-      provider: "gemini",
-      run: async () =>
-        await runGeminiEmbeddingBatches({
-          gemini,
-          agentId: this.agentId,
-          requests,
-          wait: this.batch.wait,
-          concurrency: this.batch.concurrency,
-          pollIntervalMs: this.batch.pollIntervalMs,
-          timeoutMs: this.batch.timeoutMs,
-          debug: (message, data) => log.debug(message, { ...data, source, chunks: chunks.length }),
-        }),
-      fallback: async () => await this.embedChunksInBatches(chunks),
-    });
-    if (Array.isArray(batchResult)) return batchResult;
-    const byCustomId = batchResult;
-
-    const toCache: Array<{ hash: string; embedding: number[] }> = [];
-    for (const [customId, embedding] of byCustomId.entries()) {
-      const mapped = mapping.get(customId);
-      if (!mapped) continue;
-      embeddings[mapped.index] = embedding;
-      toCache.push({ hash: mapped.hash, embedding });
-    }
-    this.upsertEmbeddingCache(toCache);
-    return embeddings;
-  }
-
-  private async embedBatchWithRetry(texts: string[]): Promise<number[][]> {
-    if (texts.length === 0) return [];
-    let attempt = 0;
-    let delayMs = EMBEDDING_RETRY_BASE_DELAY_MS;
-    while (true) {
-      try {
-        const timeoutMs = this.resolveEmbeddingTimeout("batch");
-        log.debug("memory embeddings: batch start", {
-          provider: this.provider.id,
-          items: texts.length,
-          timeoutMs,
-        });
-        return await this.withTimeout(
-          this.provider.embedBatch(texts),
-          timeoutMs,
-          `memory embeddings batch timed out after ${Math.round(timeoutMs / 1000)}s`,
-        );
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (!this.isRetryableEmbeddingError(message) || attempt >= EMBEDDING_RETRY_MAX_ATTEMPTS) {
-          throw err;
-        }
-        const waitMs = Math.min(
-          EMBEDDING_RETRY_MAX_DELAY_MS,
-          Math.round(delayMs * (1 + Math.random() * 0.2)),
-        );
-        log.warn(`memory embeddings rate limited; retrying in ${waitMs}ms`);
-        await new Promise((resolve) => setTimeout(resolve, waitMs));
-        delayMs *= 2;
-        attempt += 1;
-      }
-    }
-  }
-
-  private isRetryableEmbeddingError(message: string): boolean {
-    return /(rate[_ ]limit|too many requests|429|resource has been exhausted|5\d\d|cloudflare)/i.test(
-      message,
-    );
-  }
-
-  private resolveEmbeddingTimeout(kind: "query" | "batch"): number {
-    const isLocal = this.provider.id === "local";
-    if (kind === "query") {
-      return isLocal ? EMBEDDING_QUERY_TIMEOUT_LOCAL_MS : EMBEDDING_QUERY_TIMEOUT_REMOTE_MS;
-    }
-    return isLocal ? EMBEDDING_BATCH_TIMEOUT_LOCAL_MS : EMBEDDING_BATCH_TIMEOUT_REMOTE_MS;
-  }
-
-  private async embedQueryWithTimeout(text: string): Promise<number[]> {
-    const timeoutMs = this.resolveEmbeddingTimeout("query");
-    log.debug("memory embeddings: query start", { provider: this.provider.id, timeoutMs });
-    return await this.withTimeout(
-      this.provider.embedQuery(text),
-      timeoutMs,
-      `memory embeddings query timed out after ${Math.round(timeoutMs / 1000)}s`,
-    );
-  }
-
-  private async withTimeout<T>(
-    promise: Promise<T>,
-    timeoutMs: number,
-    message: string,
-  ): Promise<T> {
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return await promise;
-    let timer: NodeJS.Timeout | null = null;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-    });
-    try {
-      return (await Promise.race([promise, timeoutPromise])) as T;
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
   private async runWithConcurrency<T>(tasks: Array<() => Promise<T>>, limit: number): Promise<T[]> {
     if (tasks.length === 0) return [];
     const resolvedLimit = Math.max(1, Math.min(limit, tasks.length));
@@ -1966,115 +1507,21 @@ export class MemoryIndexManager {
     return results;
   }
 
-  private async withBatchFailureLock<T>(fn: () => Promise<T>): Promise<T> {
-    let release: () => void;
-    const wait = this.batchFailureLock;
-    this.batchFailureLock = new Promise<void>((resolve) => {
-      release = resolve;
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    message: string,
+  ): Promise<T> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return await promise;
+    let timer: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
     });
-    await wait;
     try {
-      return await fn();
+      return (await Promise.race([promise, timeoutPromise])) as T;
     } finally {
-      release!();
+      if (timer) clearTimeout(timer);
     }
-  }
-
-  private async resetBatchFailureCount(): Promise<void> {
-    await this.withBatchFailureLock(async () => {
-      if (this.batchFailureCount > 0) {
-        log.debug("memory embeddings: batch recovered; resetting failure count");
-      }
-      this.batchFailureCount = 0;
-      this.batchFailureLastError = undefined;
-      this.batchFailureLastProvider = undefined;
-    });
-  }
-
-  private async recordBatchFailure(params: {
-    provider: string;
-    message: string;
-    attempts?: number;
-    forceDisable?: boolean;
-  }): Promise<{ disabled: boolean; count: number }> {
-    return await this.withBatchFailureLock(async () => {
-      if (!this.batch.enabled) {
-        return { disabled: true, count: this.batchFailureCount };
-      }
-      const increment = params.forceDisable
-        ? BATCH_FAILURE_LIMIT
-        : Math.max(1, params.attempts ?? 1);
-      this.batchFailureCount += increment;
-      this.batchFailureLastError = params.message;
-      this.batchFailureLastProvider = params.provider;
-      const disabled = params.forceDisable || this.batchFailureCount >= BATCH_FAILURE_LIMIT;
-      if (disabled) {
-        this.batch.enabled = false;
-      }
-      return { disabled, count: this.batchFailureCount };
-    });
-  }
-
-  private isBatchTimeoutError(message: string): boolean {
-    return /timed out|timeout/i.test(message);
-  }
-
-  private async runBatchWithTimeoutRetry<T>(params: {
-    provider: string;
-    run: () => Promise<T>;
-  }): Promise<T> {
-    try {
-      return await params.run();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (this.isBatchTimeoutError(message)) {
-        log.warn(`memory embeddings: ${params.provider} batch timed out; retrying once`);
-        try {
-          return await params.run();
-        } catch (retryErr) {
-          (retryErr as { batchAttempts?: number }).batchAttempts = 2;
-          throw retryErr;
-        }
-      }
-      throw err;
-    }
-  }
-
-  private async runBatchWithFallback<T>(params: {
-    provider: string;
-    run: () => Promise<T>;
-    fallback: () => Promise<number[][]>;
-  }): Promise<T | number[][]> {
-    if (!this.batch.enabled) {
-      return await params.fallback();
-    }
-    try {
-      const result = await this.runBatchWithTimeoutRetry({
-        provider: params.provider,
-        run: params.run,
-      });
-      await this.resetBatchFailureCount();
-      return result;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const attempts = (err as { batchAttempts?: number }).batchAttempts ?? 1;
-      const forceDisable = /asyncBatchEmbedContent not available/i.test(message);
-      const failure = await this.recordBatchFailure({
-        provider: params.provider,
-        message,
-        attempts,
-        forceDisable,
-      });
-      const suffix = failure.disabled ? "disabling batch" : "keeping batch enabled";
-      log.warn(
-        `memory embeddings: ${params.provider} batch failed (${failure.count}/${BATCH_FAILURE_LIMIT}); ${suffix}; falling back to non-batch embeddings: ${message}`,
-      );
-      return await params.fallback();
-    }
-  }
-
-  private getIndexConcurrency(): number {
-    return this.batch.enabled ? this.batch.concurrency : EMBEDDING_INDEX_CONCURRENCY;
   }
 
   private async indexFile(
@@ -2085,9 +1532,11 @@ export class MemoryIndexManager {
     const chunks = chunkMarkdown(content, this.settings.chunking).filter(
       (chunk) => chunk.text.trim().length > 0,
     );
-    const embeddings = this.batch.enabled
-      ? await this.embedChunksWithBatch(chunks, entry, options.source)
-      : await this.embedChunksInBatches(chunks);
+    const embeddings = await this.embeddingService.embedChunksForFile(
+      chunks,
+      entry,
+      options.source,
+    );
     const sample = embeddings.find((embedding) => embedding.length > 0);
     const vectorReady = sample ? await this.ensureVectorReady(sample.length) : false;
     const now = Date.now();
