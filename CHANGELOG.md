@@ -17,6 +17,12 @@ Status: unreleased.
 - Refactor: add centralized error utilities with ClawdbotError base class.
 - Refactor: extract EmbeddingService from memory manager (reduces manager.ts by 25%).
 - Docs: add large file analysis for refactoring opportunities.
+- Web UI: add onboarding wizard progress indicator with step visualization.
+- Web UI: add skills quick-toggle panel in topbar for fast enable/disable.
+- Web UI: add config presets system (Fast Chat, Coding Agent, Voice Assistant, Privacy First).
+- Web UI: add config view levels (Basic/Standard/Advanced) to reduce complexity.
+- Web UI: add voice input button for mobile WebChat using Web Speech API.
+- Web UI: improve mobile responsiveness (safe-area insets, 44px touch targets, bottom sheets).
 - Commands: group /help and /commands output with Telegram paging. (#2504) Thanks @hougangdev.
 - macOS: limit project-local `node_modules/.bin` PATH preference to debug builds (reduce PATH hijacking risk).
 - Tools: add per-sender group tool policies and fix precedence. (#1757) Thanks @adam91holt.
