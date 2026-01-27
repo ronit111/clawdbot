@@ -1,9 +1,10 @@
 import fs from "node:fs";
 
 import type { ClawdbotConfig } from "../config/config.js";
+import { getSecret } from "../infra/secrets-manager.js";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../routing/session-key.js";
 
-export type TelegramTokenSource = "env" | "tokenFile" | "config" | "none";
+export type TelegramTokenSource = "env" | "tokenFile" | "config" | "secrets" | "none";
 
 export type TelegramTokenResolution = {
   token: string;
@@ -14,13 +15,40 @@ type ResolveTelegramTokenOpts = {
   envToken?: string | null;
   accountId?: string | null;
   logMissingFile?: (message: string) => void;
+  /** Skip secrets manager lookup (for testing config/env precedence in isolation) */
+  skipSecrets?: boolean;
 };
 
+/**
+ * Resolves the secret key name for a Telegram token.
+ */
+function getTelegramSecretKey(accountId: string): string {
+  return `telegram-token-${accountId}`;
+}
+
+/**
+ * Resolves Telegram bot token from multiple sources in priority order:
+ * 1. Secure secrets storage (keychain/encrypted file)
+ * 2. Token file (channels.telegram.tokenFile or account-specific)
+ * 3. Config file (channels.telegram.botToken)
+ * 4. Environment variable (TELEGRAM_BOT_TOKEN) for default account only
+ */
 export function resolveTelegramToken(
   cfg?: ClawdbotConfig,
   opts: ResolveTelegramTokenOpts = {},
 ): TelegramTokenResolution {
   const accountId = normalizeAccountId(opts.accountId);
+
+  // Priority 1: Check secure secrets storage first (unless explicitly skipped)
+  if (!opts.skipSecrets) {
+    const secretKey = getTelegramSecretKey(accountId);
+    const secretResult = getSecret(secretKey);
+    if (secretResult.success && secretResult.value) {
+      const secretToken = secretResult.value.trim();
+      if (secretToken) return { token: secretToken, source: "secrets" };
+    }
+  }
+
   const telegramCfg = cfg?.channels?.telegram;
   const accountCfg =
     accountId !== DEFAULT_ACCOUNT_ID

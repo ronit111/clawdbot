@@ -21,7 +21,8 @@ describe("resolveTelegramToken", () => {
     const cfg = {
       channels: { telegram: { botToken: "cfg-token" } },
     } as ClawdbotConfig;
-    const res = resolveTelegramToken(cfg);
+    // Skip secrets to test config/env precedence in isolation
+    const res = resolveTelegramToken(cfg, { skipSecrets: true });
     expect(res.token).toBe("cfg-token");
     expect(res.source).toBe("config");
   });
@@ -31,7 +32,8 @@ describe("resolveTelegramToken", () => {
     const cfg = {
       channels: { telegram: {} },
     } as ClawdbotConfig;
-    const res = resolveTelegramToken(cfg);
+    // Skip secrets to test config/env precedence in isolation
+    const res = resolveTelegramToken(cfg, { skipSecrets: true });
     expect(res.token).toBe("env-token");
     expect(res.source).toBe("env");
   });
@@ -42,7 +44,8 @@ describe("resolveTelegramToken", () => {
     const tokenFile = path.join(dir, "token.txt");
     fs.writeFileSync(tokenFile, "file-token\n", "utf-8");
     const cfg = { channels: { telegram: { tokenFile } } } as ClawdbotConfig;
-    const res = resolveTelegramToken(cfg);
+    // Skip secrets to test tokenFile precedence in isolation
+    const res = resolveTelegramToken(cfg, { skipSecrets: true });
     expect(res.token).toBe("file-token");
     expect(res.source).toBe("tokenFile");
     fs.rmSync(dir, { recursive: true, force: true });
@@ -53,7 +56,8 @@ describe("resolveTelegramToken", () => {
     const cfg = {
       channels: { telegram: { botToken: "cfg-token" } },
     } as ClawdbotConfig;
-    const res = resolveTelegramToken(cfg);
+    // Skip secrets to test config/env precedence in isolation
+    const res = resolveTelegramToken(cfg, { skipSecrets: true });
     expect(res.token).toBe("cfg-token");
     expect(res.source).toBe("config");
   });
@@ -65,7 +69,8 @@ describe("resolveTelegramToken", () => {
     const cfg = {
       channels: { telegram: { tokenFile, botToken: "cfg-token" } },
     } as ClawdbotConfig;
-    const res = resolveTelegramToken(cfg);
+    // Skip secrets to test tokenFile error behavior in isolation
+    const res = resolveTelegramToken(cfg, { skipSecrets: true });
     expect(res.token).toBe("");
     expect(res.source).toBe("none");
     fs.rmSync(dir, { recursive: true, force: true });

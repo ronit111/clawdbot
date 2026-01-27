@@ -13,7 +13,8 @@ describe("resolveDiscordToken", () => {
     const cfg = {
       channels: { discord: { token: "cfg-token" } },
     } as ClawdbotConfig;
-    const res = resolveDiscordToken(cfg);
+    // Skip secrets to test config/env precedence in isolation
+    const res = resolveDiscordToken(cfg, { skipSecrets: true });
     expect(res.token).toBe("cfg-token");
     expect(res.source).toBe("config");
   });
@@ -23,7 +24,8 @@ describe("resolveDiscordToken", () => {
     const cfg = {
       channels: { discord: {} },
     } as ClawdbotConfig;
-    const res = resolveDiscordToken(cfg);
+    // Skip secrets to test config/env precedence in isolation
+    const res = resolveDiscordToken(cfg, { skipSecrets: true });
     expect(res.token).toBe("env-token");
     expect(res.source).toBe("env");
   });
@@ -40,8 +42,18 @@ describe("resolveDiscordToken", () => {
         },
       },
     } as ClawdbotConfig;
-    const res = resolveDiscordToken(cfg, { accountId: "work" });
+    // Skip secrets to test config/env precedence in isolation
+    const res = resolveDiscordToken(cfg, { accountId: "work", skipSecrets: true });
     expect(res.token).toBe("acct-token");
     expect(res.source).toBe("config");
+  });
+
+  it("returns source=none when no token is available", () => {
+    const cfg = {
+      channels: { discord: {} },
+    } as ClawdbotConfig;
+    const res = resolveDiscordToken(cfg, { skipSecrets: true });
+    expect(res.token).toBe("");
+    expect(res.source).toBe("none");
   });
 });

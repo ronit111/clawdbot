@@ -1,10 +1,18 @@
 import type { ClawdbotConfig } from "../config/config.js";
 import type { SlackAccountConfig } from "../config/types.js";
 import { normalizeChatType } from "../channels/chat-type.js";
+import { getSecret } from "../infra/secrets-manager.js";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../routing/session-key.js";
 import { resolveSlackAppToken, resolveSlackBotToken } from "./token.js";
 
-export type SlackTokenSource = "env" | "config" | "none";
+export type SlackTokenSource = "env" | "config" | "secrets" | "none";
+
+/**
+ * Resolves the secret key name for Slack tokens.
+ */
+function getSlackSecretKey(accountId: string, tokenType: "bot" | "app"): string {
+  return `slack-${tokenType}-token-${accountId}`;
+}
 
 export type ResolvedSlackAccount = {
   accountId: string;
@@ -63,9 +71,17 @@ function mergeSlackAccountConfig(cfg: ClawdbotConfig, accountId: string): SlackA
   return { ...base, ...account };
 }
 
+/**
+ * Resolves Slack tokens from multiple sources in priority order:
+ * 1. Secure secrets storage (keychain/encrypted file)
+ * 2. Config file (channels.slack.botToken / appToken)
+ * 3. Environment variables (SLACK_BOT_TOKEN / SLACK_APP_TOKEN) for default account only
+ */
 export function resolveSlackAccount(params: {
   cfg: ClawdbotConfig;
   accountId?: string | null;
+  /** Skip secrets manager lookup (for testing config/env precedence in isolation) */
+  skipSecrets?: boolean;
 }): ResolvedSlackAccount {
   const accountId = normalizeAccountId(params.accountId);
   const baseEnabled = params.cfg.channels?.slack?.enabled !== false;
@@ -73,14 +89,46 @@ export function resolveSlackAccount(params: {
   const accountEnabled = merged.enabled !== false;
   const enabled = baseEnabled && accountEnabled;
   const allowEnv = accountId === DEFAULT_ACCOUNT_ID;
-  const envBot = allowEnv ? resolveSlackBotToken(process.env.SLACK_BOT_TOKEN) : undefined;
-  const envApp = allowEnv ? resolveSlackAppToken(process.env.SLACK_APP_TOKEN) : undefined;
+
+  // Priority 1: Check secure secrets storage first (unless explicitly skipped)
+  let secretsBot: string | undefined;
+  let secretsApp: string | undefined;
+  if (!params.skipSecrets) {
+    const botSecretResult = getSecret(getSlackSecretKey(accountId, "bot"));
+    if (botSecretResult.success && botSecretResult.value) {
+      secretsBot = botSecretResult.value.trim() || undefined;
+    }
+    const appSecretResult = getSecret(getSlackSecretKey(accountId, "app"));
+    if (appSecretResult.success && appSecretResult.value) {
+      secretsApp = appSecretResult.value.trim() || undefined;
+    }
+  }
+
+  // Priority 2: Config file
   const configBot = resolveSlackBotToken(merged.botToken);
   const configApp = resolveSlackAppToken(merged.appToken);
-  const botToken = configBot ?? envBot;
-  const appToken = configApp ?? envApp;
-  const botTokenSource: SlackTokenSource = configBot ? "config" : envBot ? "env" : "none";
-  const appTokenSource: SlackTokenSource = configApp ? "config" : envApp ? "env" : "none";
+
+  // Priority 3: Environment variables (default account only)
+  const envBot = allowEnv ? resolveSlackBotToken(process.env.SLACK_BOT_TOKEN) : undefined;
+  const envApp = allowEnv ? resolveSlackAppToken(process.env.SLACK_APP_TOKEN) : undefined;
+
+  // Resolve final tokens with priority order
+  const botToken = secretsBot ?? configBot ?? envBot;
+  const appToken = secretsApp ?? configApp ?? envApp;
+  const botTokenSource: SlackTokenSource = secretsBot
+    ? "secrets"
+    : configBot
+      ? "config"
+      : envBot
+        ? "env"
+        : "none";
+  const appTokenSource: SlackTokenSource = secretsApp
+    ? "secrets"
+    : configApp
+      ? "config"
+      : envApp
+        ? "env"
+        : "none";
 
   return {
     accountId,
