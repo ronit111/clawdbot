@@ -1268,6 +1268,100 @@ export function maxAsk(a: ExecAsk, b: ExecAsk): ExecAsk {
 
 export type ExecApprovalDecision = "allow-once" | "allow-always" | "deny";
 
+/**
+ * SECURITY: One-time-use nonce tracking to prevent replay attacks.
+ * Each nonce can only be used once and expires after TTL.
+ */
+type NonceEntry = {
+  createdAt: number;
+  consumed: boolean;
+};
+
+const NONCE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const NONCE_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
+const pendingNonces = new Map<string, NonceEntry>();
+let nonceCleanupInterval: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Generate a cryptographically secure nonce for one-time use.
+ */
+export function generateApprovalNonce(): string {
+  const nonce = crypto.randomBytes(32).toString("base64url");
+  pendingNonces.set(nonce, { createdAt: Date.now(), consumed: false });
+  startNonceCleanup();
+  return nonce;
+}
+
+/**
+ * Verify and consume a nonce. Returns true if the nonce is valid and unused.
+ * The nonce is marked as consumed after successful verification.
+ */
+export function verifyAndConsumeNonce(nonce: string): boolean {
+  const entry = pendingNonces.get(nonce);
+  if (!entry) return false; // Unknown nonce
+  if (entry.consumed) return false; // Already used (replay attempt)
+  if (Date.now() - entry.createdAt > NONCE_TTL_MS) {
+    // Expired nonce
+    pendingNonces.delete(nonce);
+    return false;
+  }
+  // Mark as consumed (one-time use)
+  entry.consumed = true;
+  return true;
+}
+
+/**
+ * Check if a nonce is valid without consuming it.
+ * Useful for validation before processing.
+ */
+export function isNonceValid(nonce: string): boolean {
+  const entry = pendingNonces.get(nonce);
+  if (!entry) return false;
+  if (entry.consumed) return false;
+  if (Date.now() - entry.createdAt > NONCE_TTL_MS) return false;
+  return true;
+}
+
+/**
+ * Start periodic cleanup of expired nonces if not already running.
+ */
+function startNonceCleanup(): void {
+  if (nonceCleanupInterval) return;
+  nonceCleanupInterval = setInterval(() => {
+    const now = Date.now();
+    for (const [nonce, entry] of pendingNonces) {
+      if (now - entry.createdAt > NONCE_TTL_MS) {
+        pendingNonces.delete(nonce);
+      }
+    }
+    // Stop cleanup if no pending nonces
+    if (pendingNonces.size === 0 && nonceCleanupInterval) {
+      clearInterval(nonceCleanupInterval);
+      nonceCleanupInterval = null;
+    }
+  }, NONCE_CLEANUP_INTERVAL_MS);
+  // Don't prevent process exit
+  nonceCleanupInterval.unref?.();
+}
+
+/**
+ * Clear all pending nonces (for testing only).
+ */
+export function clearPendingNonces(): void {
+  pendingNonces.clear();
+  if (nonceCleanupInterval) {
+    clearInterval(nonceCleanupInterval);
+    nonceCleanupInterval = null;
+  }
+}
+
+/**
+ * Get the number of pending nonces (for testing/diagnostics).
+ */
+export function getPendingNonceCount(): number {
+  return pendingNonces.size;
+}
+
 export async function requestExecApprovalViaSocket(params: {
   socketPath: string;
   token: string;
@@ -1277,6 +1371,11 @@ export async function requestExecApprovalViaSocket(params: {
   const { socketPath, token, request } = params;
   if (!socketPath || !token) return null;
   const timeoutMs = params.timeoutMs ?? 15_000;
+
+  // SECURITY: Generate a one-time-use nonce for this request
+  const nonce = generateApprovalNonce();
+  const requestId = crypto.randomUUID();
+
   return await new Promise((resolve) => {
     const client = new net.Socket();
     let settled = false;
@@ -1296,7 +1395,8 @@ export async function requestExecApprovalViaSocket(params: {
     const payload = JSON.stringify({
       type: "request",
       token,
-      id: crypto.randomUUID(),
+      id: requestId,
+      nonce, // Include nonce in request
       request,
     });
 
@@ -1313,8 +1413,25 @@ export async function requestExecApprovalViaSocket(params: {
         idx = buffer.indexOf("\n");
         if (!line) continue;
         try {
-          const msg = JSON.parse(line) as { type?: string; decision?: ExecApprovalDecision };
+          const msg = JSON.parse(line) as {
+            type?: string;
+            decision?: ExecApprovalDecision;
+            nonce?: string;
+            id?: string;
+          };
           if (msg?.type === "decision" && msg.decision) {
+            // SECURITY: Verify the response matches our request
+            if (msg.id !== requestId) {
+              // Request ID mismatch - potential attack
+              continue;
+            }
+            // SECURITY: Verify and consume the nonce (one-time use)
+            if (msg.nonce && !verifyAndConsumeNonce(msg.nonce)) {
+              // Invalid or replayed nonce
+              clearTimeout(timer);
+              finish(null);
+              return;
+            }
             clearTimeout(timer);
             finish(msg.decision);
             return;

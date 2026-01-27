@@ -8,10 +8,14 @@ import { getPairingAdapter } from "../channels/plugins/pairing.js";
 import type { ChannelId, ChannelPairingAdapter } from "../channels/plugins/types.js";
 import { resolveOAuthDir, resolveStateDir } from "../config/paths.js";
 
-const PAIRING_CODE_LENGTH = 8;
+// SECURITY: 16 chars × 5 bits/char = 80 bits entropy (increased from 40 bits)
+const PAIRING_CODE_LENGTH = 16;
 const PAIRING_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const PAIRING_PENDING_TTL_MS = 60 * 60 * 1000;
 const PAIRING_PENDING_MAX = 3;
+// Rate limiting: max attempts per minute per channel
+const PAIRING_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const PAIRING_RATE_LIMIT_MAX_ATTEMPTS = 10;
 const PAIRING_STORE_LOCK_OPTIONS = {
   retries: {
     retries: 10,
@@ -36,7 +40,97 @@ export type PairingRequest = {
 type PairingStore = {
   version: 1;
   requests: PairingRequest[];
+  /** HMAC signature for integrity verification (computed over requests) */
+  signature?: string;
 };
+
+/** Rate limit tracking for pairing attempts */
+type PairingRateLimitEntry = {
+  attempts: number;
+  windowStartMs: number;
+};
+
+/** In-memory rate limit tracker (per channel) */
+const rateLimitTracker = new Map<string, PairingRateLimitEntry>();
+
+/**
+ * Compute HMAC-SHA256 signature for pairing store integrity.
+ * Uses a machine-derived key for signing.
+ */
+function computePairingStoreSignature(requests: PairingRequest[]): string {
+  // Derive a machine-specific key from hostname + platform
+  const machineKey = crypto
+    .createHash("sha256")
+    .update(`clawdbot-pairing-${os.hostname()}-${os.platform()}`)
+    .digest();
+
+  const content = JSON.stringify(
+    requests.map((r) => ({ id: r.id, code: r.code, createdAt: r.createdAt })),
+  );
+
+  return crypto.createHmac("sha256", machineKey).update(content).digest("hex");
+}
+
+/**
+ * Verify HMAC signature of pairing store.
+ * Returns true if signature is valid or missing (for backwards compatibility).
+ */
+function verifyPairingStoreSignature(store: PairingStore): boolean {
+  if (!store.signature) return true; // Backwards compatibility: unsigned stores are accepted
+  const expected = computePairingStoreSignature(store.requests);
+  return crypto.timingSafeEqual(Buffer.from(store.signature, "hex"), Buffer.from(expected, "hex"));
+}
+
+/**
+ * Check if a pairing attempt is rate limited.
+ * Returns true if the attempt should be blocked.
+ */
+function isPairingRateLimited(channelKey: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitTracker.get(channelKey);
+
+  if (!entry) {
+    return false;
+  }
+
+  // Check if window has expired
+  if (now - entry.windowStartMs > PAIRING_RATE_LIMIT_WINDOW_MS) {
+    rateLimitTracker.delete(channelKey);
+    return false;
+  }
+
+  return entry.attempts >= PAIRING_RATE_LIMIT_MAX_ATTEMPTS;
+}
+
+/**
+ * Record a pairing attempt for rate limiting.
+ */
+function recordPairingAttempt(channelKey: string): void {
+  const now = Date.now();
+  const entry = rateLimitTracker.get(channelKey);
+
+  if (!entry || now - entry.windowStartMs > PAIRING_RATE_LIMIT_WINDOW_MS) {
+    rateLimitTracker.set(channelKey, { attempts: 1, windowStartMs: now });
+    return;
+  }
+
+  entry.attempts += 1;
+}
+
+/**
+ * Write pairing store with HMAC signature for integrity.
+ */
+async function writeSignedPairingStore(
+  filePath: string,
+  requests: PairingRequest[],
+): Promise<void> {
+  const signature = computePairingStoreSignature(requests);
+  await writeJsonFile(filePath, {
+    version: 1,
+    requests,
+    signature,
+  } satisfies PairingStore);
+}
 
 type AllowFromStore = {
   version: 1;
@@ -289,6 +383,14 @@ export async function listChannelPairingRequests(
         version: 1,
         requests: [],
       });
+
+      // SECURITY: Verify store signature to detect tampering
+      if (!verifyPairingStoreSignature(value)) {
+        // Signature mismatch - clear the store
+        await writeSignedPairingStore(filePath, []);
+        return [];
+      }
+
       const reqs = Array.isArray(value.requests) ? value.requests : [];
       const nowMs = Date.now();
       const { requests: prunedExpired, removed: expiredRemoved } = pruneExpiredRequests(
@@ -300,10 +402,7 @@ export async function listChannelPairingRequests(
         PAIRING_PENDING_MAX,
       );
       if (expiredRemoved || cappedRemoved) {
-        await writeJsonFile(filePath, {
-          version: 1,
-          requests: pruned,
-        } satisfies PairingStore);
+        await writeSignedPairingStore(filePath, pruned);
       }
       return pruned
         .filter(
@@ -333,10 +432,18 @@ export async function upsertChannelPairingRequest(params: {
     filePath,
     { version: 1, requests: [] } satisfies PairingStore,
     async () => {
-      const { value } = await readJsonFile<PairingStore>(filePath, {
+      let { value } = await readJsonFile<PairingStore>(filePath, {
         version: 1,
         requests: [],
       });
+
+      // SECURITY: Verify store signature to detect tampering
+      if (!verifyPairingStoreSignature(value)) {
+        // Signature mismatch - reset to empty store
+        await writeSignedPairingStore(filePath, []);
+        value = { version: 1, requests: [] };
+      }
+
       const now = new Date().toISOString();
       const nowMs = Date.now();
       const id = normalizeId(params.id);
@@ -378,10 +485,7 @@ export async function upsertChannelPairingRequest(params: {
         };
         reqs[existingIdx] = next;
         const { requests: capped } = pruneExcessRequests(reqs, PAIRING_PENDING_MAX);
-        await writeJsonFile(filePath, {
-          version: 1,
-          requests: capped,
-        } satisfies PairingStore);
+        await writeSignedPairingStore(filePath, capped);
         return { code, created: false };
       }
 
@@ -392,10 +496,7 @@ export async function upsertChannelPairingRequest(params: {
       reqs = capped;
       if (PAIRING_PENDING_MAX > 0 && reqs.length >= PAIRING_PENDING_MAX) {
         if (expiredRemoved || cappedRemoved) {
-          await writeJsonFile(filePath, {
-            version: 1,
-            requests: reqs,
-          } satisfies PairingStore);
+          await writeSignedPairingStore(filePath, reqs);
         }
         return { code: "", created: false };
       }
@@ -407,23 +508,32 @@ export async function upsertChannelPairingRequest(params: {
         lastSeenAt: now,
         ...(meta ? { meta } : {}),
       };
-      await writeJsonFile(filePath, {
-        version: 1,
-        requests: [...reqs, next],
-      } satisfies PairingStore);
+      await writeSignedPairingStore(filePath, [...reqs, next]);
       return { code, created: true };
     },
   );
 }
 
+export type ApproveChannelPairingCodeResult =
+  | { id: string; entry?: PairingRequest }
+  | { rateLimited: true }
+  | null;
+
 export async function approveChannelPairingCode(params: {
   channel: PairingChannel;
   code: string;
   env?: NodeJS.ProcessEnv;
-}): Promise<{ id: string; entry?: PairingRequest } | null> {
+}): Promise<ApproveChannelPairingCodeResult> {
   const env = params.env ?? process.env;
   const code = params.code.trim().toUpperCase();
   if (!code) return null;
+
+  // SECURITY: Rate limit pairing attempts to prevent brute-force attacks
+  const channelKey = safeChannelKey(params.channel);
+  if (isPairingRateLimited(channelKey)) {
+    return { rateLimited: true };
+  }
+  recordPairingAttempt(channelKey);
 
   const filePath = resolvePairingPath(params.channel, env);
   return await withFileLock(
@@ -434,26 +544,29 @@ export async function approveChannelPairingCode(params: {
         version: 1,
         requests: [],
       });
+
+      // SECURITY: Verify store signature to detect tampering
+      if (!verifyPairingStoreSignature(value)) {
+        // Signature mismatch - store may have been tampered with
+        // Clear the store and return null (force re-pairing)
+        await writeSignedPairingStore(filePath, []);
+        return null;
+      }
+
       const reqs = Array.isArray(value.requests) ? value.requests : [];
       const nowMs = Date.now();
       const { requests: pruned, removed } = pruneExpiredRequests(reqs, nowMs);
       const idx = pruned.findIndex((r) => String(r.code ?? "").toUpperCase() === code);
       if (idx < 0) {
         if (removed) {
-          await writeJsonFile(filePath, {
-            version: 1,
-            requests: pruned,
-          } satisfies PairingStore);
+          await writeSignedPairingStore(filePath, pruned);
         }
         return null;
       }
       const entry = pruned[idx];
       if (!entry) return null;
       pruned.splice(idx, 1);
-      await writeJsonFile(filePath, {
-        version: 1,
-        requests: pruned,
-      } satisfies PairingStore);
+      await writeSignedPairingStore(filePath, pruned);
       await addChannelAllowFromStoreEntry({
         channel: params.channel,
         entry: entry.id,

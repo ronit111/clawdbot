@@ -80,6 +80,8 @@ export async function approveTelegramPairingCode(params: {
     env: params.env,
   });
   if (!res) return null;
+  // Handle rate limiting case - treat as no match
+  if ("rateLimited" in res) return null;
   const entry = res.entry
     ? {
         chatId: res.entry.id,

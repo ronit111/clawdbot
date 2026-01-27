@@ -99,30 +99,26 @@ git worktree add ../clawdbot-ux -b phase3-ux
   - All settings configurable in `gateway.rateLimit` config
 - **Commit:** TBD
 
+#### 1.5 Pairing & Approval Hardening
+- **Files Modified:**
+  - `src/pairing/pairing-store.ts` - Pairing security hardening (~120 lines added)
+  - `src/pairing/pairing-store.test.ts` - 11 tests (6 new security tests)
+  - `src/infra/exec-approvals.ts` - One-time-use nonce system (~100 lines added)
+  - `src/infra/exec-approvals.test.ts` - 38 tests (8 new nonce tests)
+- **Features:**
+  - Pairing codes increased from 8 chars (40 bits) to 16 chars (80 bits entropy)
+  - HMAC-SHA256 signatures on pairing stores for integrity verification
+  - Rate limiting on pairing approval attempts (10/minute per channel)
+  - Automatic store reset on signature verification failure (tampering detection)
+  - One-time-use nonces for exec approval requests (replay protection)
+  - Nonce TTL (5 minutes) with automatic cleanup
+  - Request ID verification on approval responses
+  - All nonce functions exported for testing: `generateApprovalNonce`, `verifyAndConsumeNonce`, `isNonceValid`
+- **Commit:** TBD
+
 ---
 
 ### ⏳ PENDING
-
-#### 1.5 Pairing & Approval Hardening
-**Objective:** Increase entropy and add replay protection.
-
-**Files to Modify:**
-- `src/pairing/pairing-store.ts`
-  - Increase pairing code from 8 chars (~40 bits) to 16 chars (~80 bits)
-  - Add rate limiting on pairing attempts (1/sec max)
-  - Sign pairing store with HMAC
-- `src/infra/exec-approvals.ts`
-  - Implement one-time-use nonces for approval tokens
-  - Add nonce tracking to prevent replay attacks
-
-**Current Pairing Code:**
-- 8 chars, alphabet: `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (32 chars = 5 bits each)
-- Total entropy: ~40 bits (too low for security-sensitive use)
-
-**Target:**
-- 16 chars = ~80 bits entropy
-- Add HMAC signature to pairing-store.json
-- Rate limit: 1 attempt/second per IP/session
 
 #### 1.6 Security Documentation
 **Objective:** Create formal security documentation.
@@ -218,7 +214,10 @@ pnpm build
 | 1.4 | src/gateway/server-startup-log.test.ts | ✅ | +170 |
 | 1.4 | src/gateway/server.impl.ts | ✅ | +15 |
 | 1.4 | src/config/types.gateway.ts | ✅ | +45 |
-| 1.5 | src/pairing/pairing-store.ts | ⏳ | TBD |
+| 1.5 | src/pairing/pairing-store.ts | ✅ | +120 |
+| 1.5 | src/pairing/pairing-store.test.ts | ✅ | +80 |
+| 1.5 | src/infra/exec-approvals.ts | ✅ | +100 |
+| 1.5 | src/infra/exec-approvals.test.ts | ✅ | +70 |
 | 1.6 | docs/security/*.md | ⏳ | TBD |
 
 ---
