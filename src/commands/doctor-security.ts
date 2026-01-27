@@ -1,7 +1,11 @@
+import fs from "node:fs";
+import path from "node:path";
+
 import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
 import { listChannelPlugins } from "../channels/plugins/index.js";
 import type { ChannelId } from "../channels/plugins/types.js";
 import type { ClawdbotConfig, GatewayBindMode } from "../config/config.js";
+import { resolveStateDir } from "../config/paths.js";
 import { readChannelAllowFromStore } from "../pairing/pairing-store.js";
 import { note } from "../terminal/note.js";
 import { formatCliCommand } from "../cli/command-format.js";
@@ -69,6 +73,34 @@ export async function noteSecurityWarnings(cfg: ClawdbotConfig) {
         `- WARNING: Gateway bound to ${bindDescriptor} (network-accessible).`,
         `  Ensure your auth credentials are strong and not exposed.`,
       );
+    }
+  }
+
+  // ===========================================
+  // CREDENTIAL ENCRYPTION CHECK
+  // ===========================================
+  // Check for unencrypted credential files that should be encrypted
+
+  const stateDir = resolveStateDir(process.env);
+  const credentialFiles = [
+    { path: path.join(stateDir, "credentials", "whatsapp", "creds.json"), name: "WhatsApp" },
+    { path: path.join(stateDir, "credentials", "web", "creds.json"), name: "Web" },
+  ];
+
+  for (const credFile of credentialFiles) {
+    try {
+      if (fs.existsSync(credFile.path)) {
+        // Check if there's an encrypted version
+        const encPath = `${credFile.path}.enc`;
+        if (!fs.existsSync(encPath)) {
+          warnings.push(
+            `- WARNING: ${credFile.name} credentials stored unencrypted at ${credFile.path}`,
+            `  Consider encrypting sensitive credentials for better security.`,
+          );
+        }
+      }
+    } catch {
+      // Ignore access errors
     }
   }
 

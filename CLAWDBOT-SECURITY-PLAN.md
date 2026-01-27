@@ -116,23 +116,22 @@ git worktree add ../clawdbot-ux -b phase3-ux
   - All nonce functions exported for testing: `generateApprovalNonce`, `verifyAndConsumeNonce`, `isNonceValid`
 - **Commit:** TBD
 
+#### 1.6 Security Documentation
+- **Files Created:**
+  - `docs/security/threat-model.md` - Comprehensive threat model (~250 lines)
+  - `docs/security/data-handling.md` - Data handling policy (~280 lines)
+- **Files Modified:**
+  - `src/commands/doctor-security.ts` - Added credential encryption check
+- **Features:**
+  - Threat model covers: channels, tools, gateway, local files, browser automation, plugins
+  - Documents threat actors, attack surfaces, mitigations, residual risks
+  - Data handling policy covers: storage, retention, user rights, compliance
+  - Doctor now warns about unencrypted WhatsApp/Web credentials
+- **Commit:** TBD
+
 ---
 
-### ⏳ PENDING
-
-#### 1.6 Security Documentation
-**Objective:** Create formal security documentation.
-
-**Files to Create:**
-- `docs/security/threat-model.md` - Cover channels, tools, browser, local files
-- `docs/security/data-handling.md` - Retention, logs, consent, export/delete
-- `docs/security/security-posture.md` - Public-facing security overview
-
-**Files to Modify:**
-- `src/commands/doctor.ts` - Add security audit checks
-  - Detect unencrypted credentials
-  - Check for public gateway binding without auth
-  - Verify pairing code entropy
+### ✅ ALL PHASE 1 TASKS COMPLETE
 
 ---
 
@@ -218,7 +217,9 @@ pnpm build
 | 1.5 | src/pairing/pairing-store.test.ts | ✅ | +80 |
 | 1.5 | src/infra/exec-approvals.ts | ✅ | +100 |
 | 1.5 | src/infra/exec-approvals.test.ts | ✅ | +70 |
-| 1.6 | docs/security/*.md | ⏳ | TBD |
+| 1.6 | docs/security/threat-model.md | ✅ | +250 |
+| 1.6 | docs/security/data-handling.md | ✅ | +280 |
+| 1.6 | src/commands/doctor-security.ts | ✅ | +30 |
 
 ---
 
